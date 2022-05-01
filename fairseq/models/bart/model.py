@@ -65,6 +65,17 @@ class BARTModel(TransformerModel):
             action="store_true",
             help="Apply spectral normalization on the classification head",
         )
+        parser.add_argument(
+            "--allow-vocab-expansion",
+            action="store_true",
+            help="Allow defining a larger vocabulary than defined in pretrained models",
+        )
+        parser.add_argument(
+            "--additional-languages-n",
+            type=int,
+            default=0,
+            help="Number of additional languages included during finetuing",
+        )
 
     @property
     def supported_targets(self):
@@ -219,6 +230,8 @@ class BARTModel(TransformerModel):
         # When finetuning on translation task, remove last row of
         # embedding matrix that corresponds to mask_idx token.
         loaded_dict_size = state_dict["encoder.embed_tokens.weight"].size(0)
+
+
         if (
             loaded_dict_size == len(self.encoder.dictionary) + 1
             and "<mask>" not in self.encoder.dictionary
@@ -231,44 +244,45 @@ class BARTModel(TransformerModel):
         # When continued pretraining on new set of languages for mbart,
         # add extra lang embeddings at the end of embed_tokens.
         # Note: newly added languages are assumed to have been added at the end.
-        if self.args.task == "multilingual_denoising" and loaded_dict_size < len(
-            self.encoder.dictionary
-        ):
-            logger.info(
-                "Adding extra language embeddings not found in pretrained model for "
-                "continued pretraining of MBART on new set of languages."
-            )
-            loaded_mask_token_embedding = state_dict["encoder.embed_tokens.weight"][
-                -1, :
-            ]
-
-            num_langids_to_add = len(self.encoder.dictionary) - loaded_dict_size
-            embed_dim = state_dict["encoder.embed_tokens.weight"].size(1)
-
-            new_lang_embed_to_add = torch.zeros(num_langids_to_add, embed_dim)
-            nn.init.normal_(new_lang_embed_to_add, mean=0, std=embed_dim**-0.5)
-            new_lang_embed_to_add = new_lang_embed_to_add.to(
-                dtype=state_dict["encoder.embed_tokens.weight"].dtype,
-            )
-
-            state_dict["encoder.embed_tokens.weight"] = torch.cat(
-                [
-                    state_dict["encoder.embed_tokens.weight"][
-                        : loaded_dict_size - 1, :
-                    ],
-                    new_lang_embed_to_add,
-                    loaded_mask_token_embedding.unsqueeze(0),
+        # Since we might add tokens as well as languages, we need to move the original language codes
+        if loaded_dict_size < len(self.encoder.dictionary):
+            if self.args.task == "multilingual_denoising" or getattr(self.args, "allow_vocab_expansion", False):
+                logger.info(
+                    "Adding extra language embeddings not found in pretrained model for "
+                    "continued pretraining of MBART on new set of languages."
+                )
+                loaded_mask_token_embedding = state_dict["encoder.embed_tokens.weight"][
+                    -1, :
                 ]
-            )
-            state_dict["decoder.embed_tokens.weight"] = torch.cat(
-                [
-                    state_dict["decoder.embed_tokens.weight"][
-                        : loaded_dict_size - 1, :
-                    ],
-                    new_lang_embed_to_add,
-                    loaded_mask_token_embedding.unsqueeze(0),
-                ]
-            )
+                idx = 0
+                for idx, tok in enumerate(self.encoder.dictionary.symbols[::-1]):
+                    if not tok.startswith('__') or not tok.endswith('__'):
+                        break
+                num_langs_present = idx
+                num_langs_added = getattr(self.args, 'additional_languages_n', 0)
+
+                num_langids_to_add = len(self.encoder.dictionary) - loaded_dict_size
+
+                for emb_to_change in ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight", "decoder.output_projection.weight"]:
+                    embed_dim = state_dict[emb_to_change].size(1)
+
+                    new_lang_embed_to_add = torch.zeros(num_langids_to_add, embed_dim)
+                    nn.init.normal_(new_lang_embed_to_add, mean=0, std=embed_dim**-0.5)
+                    new_lang_embed_to_add = new_lang_embed_to_add.to(
+                        dtype=state_dict[emb_to_change].dtype,
+                    )
+
+                    state_dict[emb_to_change] = torch.cat(
+                        [
+                            state_dict[emb_to_change][
+                                : loaded_dict_size - 1, :
+                            ],
+                            new_lang_embed_to_add,
+                            loaded_mask_token_embedding.unsqueeze(0),
+                        ]
+                    )
+                    state_dict[emb_to_change][-num_langs_present-1:state_dict[emb_to_change].size(0)-num_langs_added-1, :] = state_dict[emb_to_change][loaded_dict_size-num_langs_present-1:loaded_dict_size-num_langs_added-1, :]
+                    nn.init.normal_(state_dict[emb_to_change][loaded_dict_size-num_langs_present-1:loaded_dict_size-num_langs_added-1, :], mean=0, std=embed_dim**-0.5)
 
         # Copy any newly-added classification heads into the state dict
         # with their current weights.
